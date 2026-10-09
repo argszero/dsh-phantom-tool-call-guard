@@ -1,0 +1,73 @@
+# The @argszero/dsh-phantom-tool-call-guard bundle patch: mount and go.
+#
+# One report (#9215) describes a session that dies from one sequence number
+# onward, re-failing every turn with
+#
+#   format v4 tool/result at seq N requires toolCallId matching its tool source
+#
+# for a tool call the model advertised with no identity at all — an empty `id`
+# and an empty `name` at the tail of a turn.
+#
+# The identity of a tool-call block is decided by the harness's own assembler:
+#
+#   packages/llm/llm/src/assembler.ts
+#     id: partial.toolCallId ?? brandString<ToolCallId>(`call-${index}`)
+#
+# That fallback is nullish, so an adapter that emits an empty string — not a
+# missing field — defeats it and the block assembles with `id: ''`. From there
+# the failure is an asymmetry at the durable write boundary:
+#
+#   appendToolCall(block)        → tool/call lands with callId: "" — unchecked
+#   appendToolResult(...)        → encode → assertV4ToolResultMessage throws
+#                                  "requires toolCallId matching its tool source"
+#
+#   packages/session/session-format-v3-to-v4/src/tool-role.ts
+#     if (typeof toolCallId !== 'string' || toolCallId.length === 0
+#         || sourceCallId !== toolCallId) throw …
+#
+# The encoder runs *before* the append commits, so nothing is written for that
+# step, the dangling `tool/call` stays the last word of the log, and every later
+# turn resumes from the same seq, recomputes the identical result and is refused
+# again. The session is permanently stuck at that sequence number.
+#
+# The write path is core's — a plugin cannot reach it. What a plugin *can* reach
+# is the response side of the `llm/stream` waterfall:
+#
+#   packages/llm/llm/src/index.ts   the waterfall's return value is a value a
+#                                   listener may replace (the request side of the
+#                                   same waterfall is a read-only observation)
+#   packages/core/agent-loop/src/agent.ts
+#                                   for await (const chunk of stream) — the loop
+#                                   consumes exactly that value, feeding one
+#                                   AssistantStreamAttempt that both assembles the
+#                                   durable assistant/message and records the raw
+#                                   chunks for replay
+#
+# So a chunk repaired there is repaired in the message and in the replay record
+# at once, and the two cannot disagree afterwards. The listener registers with
+# `prepend: true` because a waterfall's position is part of its meaning: the
+# repair has to be the last transformation before the consumer. `global: true` is
+# because the stream is dispatched with the registry instance as the listener's
+# `this`, so a mount scoped to a profile must still cover it.
+#
+# This patch mounts the plugin and changes nothing else. `mode: 'answer'` (the
+# default) writes `call-phantom-<index>` where the block's identity was empty, so
+# the call becomes answerable: it is dispatched, fails honestly as an unknown tool
+# if the name is empty too, and its durable result closes the transaction.
+# `suppress` drops the block instead — the posture the harness already takes for
+# tool calls it cannot execute safely (max-token truncation). `observe` decides
+# and counts exactly as `answer` would and emits the stream unchanged, which is
+# how an operator measures whether this is happening in their deployment before
+# trusting a repair with it. `off` installs no listener at all. Counters, the
+# bounded history and the plugin's own declared blind spots are served as
+# `phantomToolCallGuard.snapshot()`.
+#
+# The plugin has no runtime dependency: it subscribes to an event the harness
+# dispatches and wraps the stream it is handed, so it never imports a harness
+# package for value. That is deliberate — in a `profile` deployment a plugin's own
+# dependency can materialize a second copy of a harness package, a failure this
+# repository has already shipped more than once.
+
+- insert:
+    - id: phantom-tool-call-guard
+      name: '@argszero/dsh-phantom-tool-call-guard'
