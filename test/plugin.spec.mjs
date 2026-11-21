@@ -4,8 +4,16 @@
  *
  * Each arm pairs a control with the repaired run, because the claim is not "the
  * stream looks different" but "the call the harness would have refused is the
- * call it now accepts". `plugin: false` is that control: the same chunks, the
- * same dispatch, the same assembler — and the same refusal, reproduced.
+ * call it now accepts" — and, for a block that names no tool, "the call no
+ * boundary refuses is the one the plugin keeps out of the history". `plugin:
+ * false` is that control: the same chunks, the same dispatch, the same
+ * assembler — and the same outcome, reproduced without the plugin.
+ *
+ * ## Why the fixtures are split
+ *
+ * The two failures are independent: an **id** that is empty on a call that names
+ * a tool, and a block that names **no tool** at all. 0.2 repairs the first and
+ * withholds the second, so each arm is measured on its own fixture.
  *
  * @module test/plugin.spec
  */
@@ -16,17 +24,34 @@ import { phantomId } from '../lib/stream.js'
 import { admit, assemble, collect, logText, service, streamOf, toolCall, toolResultRow, world } from './harness.mjs'
 
 /**
- * The phantom of #9215, in the shape `llm-pi-ai` emits it: a block-start, deltas
- * that all carry `id: ''` (the adapter writes `known?.id ?? ''`), and a closing
- * block whose id and name came back empty from the provider.
+ * The phantom of #9215 and #13945, in the shape `llm-pi-ai` emits it: a
+ * block-start, deltas that all carry `id: ''` (the adapter writes `known?.id ??
+ * ''`) and no name at all, and a closing block whose id and name came back empty
+ * from the provider.
  */
-const PHANTOM = [
+const PHANTOM_UNNAMED = [
   { type: 'block-start', index: 0, blockType: 'text' },
   { type: 'text-delta', index: 0, text: 'Done.' },
   { type: 'block-end', index: 0, block: { type: 'text', text: 'Done.' } },
   { type: 'block-start', index: 1, blockType: 'tool-call' },
   { type: 'tool-call-delta', index: 1, id: '', argumentsDelta: '{}' },
   { type: 'block-end', index: 1, block: { type: 'tool-call', id: '', name: '', arguments: '{}' } },
+  { type: 'finish', reason: { kind: 'tool-calls' } },
+]
+
+/** A real call whose id the adapter lost: the id arm's own subject. */
+const PHANTOM_ID_LOST = [
+  { type: 'block-start', index: 1, blockType: 'tool-call' },
+  { type: 'tool-call-delta', index: 1, id: '', name: 'read', argumentsDelta: '{}' },
+  { type: 'block-end', index: 1, block: { type: 'tool-call', id: '', name: 'read', arguments: '{}' } },
+  { type: 'finish', reason: { kind: 'tool-calls' } },
+]
+
+/** An unnamed call that *did* carry a usable id — the shape no write boundary refuses. */
+const UNNAMED_WITH_ID = [
+  { type: 'block-start', index: 1, blockType: 'tool-call' },
+  { type: 'tool-call-delta', index: 1, id: 'call-ok', argumentsDelta: '{}' },
+  { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call-ok', name: '', arguments: '{}' } },
   { type: 'finish', reason: { kind: 'tool-calls' } },
 ]
 
@@ -39,10 +64,18 @@ const ORDINARY = [
 ]
 
 /** A phantom whose closing block omits the id entirely (what a cast of `undefined` produces). */
-const PHANTOM_ABSENT = [
+const PHANTOM_UNNAMED_ABSENT = [
   { type: 'block-start', index: 1, blockType: 'tool-call' },
   { type: 'tool-call-delta', index: 1, id: '', name: '', argumentsDelta: '{}' },
   { type: 'block-end', index: 1, block: { type: 'tool-call', id: undefined, name: '', arguments: '{}' } },
+  { type: 'finish', reason: { kind: 'tool-calls' } },
+]
+
+/** The same absent id on a call that names a tool. */
+const PHANTOM_ID_ABSENT = [
+  { type: 'block-start', index: 1, blockType: 'tool-call' },
+  { type: 'tool-call-delta', index: 1, id: '', name: 'read', argumentsDelta: '{}' },
+  { type: 'block-end', index: 1, block: { type: 'tool-call', id: undefined, name: 'read', arguments: '{}' } },
   { type: 'finish', reason: { kind: 'tool-calls' } },
 ]
 
@@ -60,10 +93,15 @@ async function run(runWorld, chunks) {
   return { emitted, block, row: admit(toolResultRow(block.id)) }
 }
 
+/** Every tool-call block the emitted stream assembles to. */
+function toolCalls(emitted) {
+  return assemble(emitted).filter(block => block.type === 'tool-call')
+}
+
 describe('the report, reproduced without the plugin', () => {
   it('assembles an empty id and has its tool/result refused by the write boundary', async () => {
     const control = await world({ plugin: false })
-    const { block, row } = await run(control, PHANTOM)
+    const { block, row } = await run(control, PHANTOM_UNNAMED)
     assert.equal(block.id, '')
     assert.equal(block.name, '')
     assert.equal(row.admitted, false)
@@ -73,7 +111,7 @@ describe('the report, reproduced without the plugin', () => {
 
   it('refuses the absent-id shape for the same reason', async () => {
     const control = await world({ plugin: false })
-    const { block, row } = await run(control, PHANTOM_ABSENT)
+    const { block, row } = await run(control, PHANTOM_UNNAMED_ABSENT)
     assert.equal(block.id, undefined)
     assert.equal(row.admitted, false)
     assert.match(row.reason, /requires toolCallId matching its tool source/)
@@ -87,22 +125,75 @@ describe('the report, reproduced without the plugin', () => {
     assert.deepEqual(row, { admitted: true })
     await control.dispose()
   })
+
+  it('admits an unnamed call too, which is why admission was never the whole question', async () => {
+    // #13945 in one assertion: a call with a perfectly good id and no name passes
+    // the write boundary — the refusal it earns comes later, from the provider,
+    // when the history carrying it is replayed.
+    const control = await world({ plugin: false })
+    const { block, row } = await run(control, UNNAMED_WITH_ID)
+    assert.equal(block.id, 'call-ok')
+    assert.equal(block.name, '')
+    assert.deepEqual(row, { admitted: true })
+    await control.dispose()
+  })
 })
 
 describe('the plugin at the seam', () => {
   it('turns the refused call into one the write boundary accepts', async () => {
     const control = await world({ plugin: false })
-    const unrepaired = await run(control, PHANTOM)
+    const unrepaired = await run(control, PHANTOM_ID_LOST)
     const harness = await world()
-    const repaired = await run(harness, PHANTOM)
+    const repaired = await run(harness, PHANTOM_ID_LOST)
     assert.equal(repaired.block.id, phantomId(1))
-    assert.equal(repaired.block.name, '')
+    assert.equal(repaired.block.name, 'read')
     // The same stream, the same number of chunks, the same order: identity is
     // the only thing this plugin touches.
     assert.deepEqual(repaired.emitted.map(chunk => chunk.type), unrepaired.emitted.map(chunk => chunk.type))
     assert.deepEqual(unrepaired.row.admitted, false)
     assert.deepEqual(repaired.row, { admitted: true })
     await control.dispose()
+    await harness.dispose()
+  })
+
+  it('withholds a block that names no tool, leaving the text the model produced', async () => {
+    const harness = await world()
+    const emitted = await collect(harness.stream(PHANTOM_UNNAMED))
+    // No tool-call block survives to be assembled, so nothing can be dispatched
+    // and nothing can be replayed to a provider that refuses it. `agent-loop`
+    // returns `{ kind: 'completed' }` for exactly this message shape, so the turn
+    // ends honestly rather than poisoning the session.
+    assert.deepEqual(toolCalls(emitted), [])
+    assert.deepEqual(assemble(emitted), [{ type: 'text', text: 'Done.' }])
+    assert.deepEqual(emitted[emitted.length - 1], { type: 'finish', reason: { kind: 'tool-calls' } })
+    const snapshot = service(harness).snapshot()
+    assert.deepEqual(snapshot.counters.verdicts, { keep: 0, answer: 0, suppress: 1 })
+    assert.equal(snapshot.counters.reasons['empty-name'], 1)
+    assert.match(logText(harness.logged), /named no tool; dropped the block/)
+    await harness.dispose()
+  })
+
+  it('keeps an unnamed call when the operator asks for it, and then only its id is supplied', async () => {
+    // `unnamed: 'keep'` is the pre-0.2 posture, kept because an operator
+    // diagnosing a provider may want the call it actually made.
+    const harness = await world({ config: { unnamed: 'keep' } })
+    const { block, row } = await run(harness, PHANTOM_UNNAMED)
+    assert.equal(block.id, phantomId(1))
+    assert.equal(block.name, '')
+    assert.deepEqual(row, { admitted: true })
+    const snapshot = service(harness).snapshot()
+    assert.deepEqual(snapshot.counters.verdicts, { keep: 0, answer: 1, suppress: 0 })
+    assert.equal(snapshot.counters.reasons['empty-id'], 1)
+    await harness.dispose()
+  })
+
+  it('keeps an unnamed call whose id was already usable, untouched', async () => {
+    const harness = await world({ config: { unnamed: 'keep' } })
+    const { block, row } = await run(harness, UNNAMED_WITH_ID)
+    assert.equal(block.id, 'call-ok')
+    assert.equal(block.name, '')
+    assert.deepEqual(row, { admitted: true })
+    assert.deepEqual(service(harness).snapshot().counters.verdicts, { keep: 1, answer: 0, suppress: 0 })
     await harness.dispose()
   })
 
@@ -118,7 +209,7 @@ describe('the plugin at the seam', () => {
 
   it('repairs the absent-id shape as well', async () => {
     const harness = await world()
-    const { block, row } = await run(harness, PHANTOM_ABSENT)
+    const { block, row } = await run(harness, PHANTOM_ID_ABSENT)
     assert.equal(block.id, phantomId(1))
     assert.deepEqual(row, { admitted: true })
     await harness.dispose()
@@ -139,7 +230,7 @@ describe('the plugin at the seam', () => {
 
   it('records the decision with the route it belonged to', async () => {
     const harness = await world()
-    await run(harness, PHANTOM)
+    await run(harness, PHANTOM_ID_LOST)
     const snapshot = service(harness).snapshot()
     assert.equal(snapshot.counters.streams, 1)
     assert.equal(snapshot.counters.errors, 0)
@@ -153,6 +244,23 @@ describe('the plugin at the seam', () => {
       verdict: 'answer',
       reason: 'empty-id',
       written: phantomId(1),
+      name: 'read',
+    }])
+    await harness.dispose()
+  })
+
+  it('records a withheld block as the evidence it was', async () => {
+    const harness = await world()
+    await collect(harness.stream(PHANTOM_UNNAMED))
+    const snapshot = service(harness).snapshot()
+    assert.deepEqual(snapshot.recent, [{
+      provider: 'target',
+      model: 'model-1',
+      sessionId: undefined,
+      index: 1,
+      verdict: 'suppress',
+      reason: 'empty-name',
+      written: undefined,
       // The stream declared no name: the deltas omitted it and the closing block
       // stated it empty, and an empty name is not a name.
       name: undefined,
@@ -170,7 +278,7 @@ describe('the plugin at the seam', () => {
 
   it('names the session in the log line when the request carries one', async () => {
     const harness = await world()
-    await collect(harness.stream(PHANTOM, { sessionId: 'sess-7' }))
+    await collect(harness.stream(PHANTOM_ID_LOST, { sessionId: 'sess-7' }))
     assert.equal(service(harness).snapshot().recent[0].sessionId, 'sess-7')
     assert.match(logText(harness.logged), /closed without an id; wrote "call-phantom-1"/)
     await harness.dispose()
@@ -180,9 +288,9 @@ describe('the plugin at the seam', () => {
 describe('observe measures without acting', () => {
   it('emits the stream the unrepaired control emitted, and counts the same decision', async () => {
     const control = await world({ plugin: false })
-    const unrepaired = await run(control, PHANTOM)
+    const unrepaired = await run(control, PHANTOM_ID_LOST)
     const harness = await world({ config: { mode: 'observe' } })
-    const observed = await run(harness, PHANTOM)
+    const observed = await run(harness, PHANTOM_ID_LOST)
     assert.deepEqual(observed.emitted, unrepaired.emitted)
     assert.deepEqual(observed.row, unrepaired.row)
     assert.equal(observed.row.admitted, false)
@@ -196,12 +304,28 @@ describe('observe measures without acting', () => {
     await control.dispose()
     await harness.dispose()
   })
+
+  it('counts a block it would withhold without withholding it', async () => {
+    const control = await world({ plugin: false })
+    const unrepaired = await run(control, PHANTOM_UNNAMED)
+    const harness = await world({ config: { mode: 'observe' } })
+    const emitted = await collect(harness.stream(PHANTOM_UNNAMED))
+    assert.deepEqual(emitted, unrepaired.emitted)
+    assert.equal(toolCalls(emitted).length, 1)
+    const snapshot = service(harness).snapshot()
+    assert.deepEqual(snapshot.counters.verdicts, { keep: 0, answer: 0, suppress: 1 })
+    assert.equal(snapshot.counters.reasons['empty-name'], 1)
+    assert.equal(snapshot.recent[0].written, undefined)
+    assert.match(logText(harness.logged), /would drop the block/)
+    await control.dispose()
+    await harness.dispose()
+  })
 })
 
 describe('suppress removes the call instead of naming it', () => {
   it('leaves no tool-call block for the assembler to poison itself with', async () => {
     const harness = await world({ config: { mode: 'suppress' } })
-    const emitted = await collect(harness.stream(PHANTOM))
+    const emitted = await collect(harness.stream(PHANTOM_UNNAMED))
     assert.deepEqual(emitted.filter(chunk => chunk.type === 'tool-call-delta' || chunk.type === 'block-end'), [
       { type: 'block-end', index: 0, block: { type: 'text', text: 'Done.' } },
     ])
@@ -212,14 +336,24 @@ describe('suppress removes the call instead of naming it', () => {
     assert.match(logText(harness.logged), /dropped the block/)
     await harness.dispose()
   })
+
+  it('drops a named call whose id is empty as well', async () => {
+    const harness = await world({ config: { mode: 'suppress' } })
+    const emitted = await collect(harness.stream(PHANTOM_ID_LOST))
+    assert.deepEqual(toolCalls(emitted), [])
+    const snapshot = service(harness).snapshot()
+    assert.deepEqual(snapshot.counters.verdicts, { keep: 0, answer: 0, suppress: 1 })
+    assert.equal(snapshot.counters.reasons['empty-id'], 1)
+    await harness.dispose()
+  })
 })
 
 describe('off installs no listener', () => {
   it('emits the unrepaired stream and still provides the service', async () => {
     const control = await world({ plugin: false })
-    const unrepaired = await run(control, PHANTOM)
+    const unrepaired = await run(control, PHANTOM_UNNAMED)
     const harness = await world({ config: { mode: 'off' } })
-    const emitted = await collect(harness.stream(PHANTOM))
+    const emitted = await collect(harness.stream(PHANTOM_UNNAMED))
     assert.deepEqual(emitted, unrepaired.emitted)
     const snapshot = service(harness).snapshot()
     assert.equal(snapshot.mode, 'off')
@@ -233,8 +367,8 @@ describe('the listener position', () => {
   /** A block that a provider would never emit, used to place a stream in the chain. */
   const INJECTED = [
     { type: 'block-start', index: 9, blockType: 'tool-call' },
-    { type: 'tool-call-delta', index: 9, id: '', argumentsDelta: '{}' },
-    { type: 'block-end', index: 9, block: { type: 'tool-call', id: '', name: '', arguments: '{}' } },
+    { type: 'tool-call-delta', index: 9, id: '', name: 'write', argumentsDelta: '{}' },
+    { type: 'block-end', index: 9, block: { type: 'tool-call', id: '', name: 'write', arguments: '{}' } },
   ]
 
   it('covers a block emitted by a listener mounted inside it', async () => {
@@ -290,9 +424,9 @@ describe('the listener position', () => {
     // guard registers as `global` so a scoped mount still covers every call.
     const excluding = { [Symbol.for('cordis.filter')]: () => false }
     const blocks = assemble(await collect(
-      harness.ctx.waterfall(excluding, 'llm/stream', { provider: 'target', model: 'model-1', messages: [] }, () => streamOf(PHANTOM)),
+      harness.ctx.waterfall(excluding, 'llm/stream', { provider: 'target', model: 'model-1', messages: [] }, () => streamOf(PHANTOM_ID_LOST)),
     ))
-    assert.equal(blocks[1].id, phantomId(1))
+    assert.equal(blocks[0].id, phantomId(1))
     await harness.dispose()
   })
 })
@@ -306,10 +440,10 @@ describe('fail-open at the plugin', () => {
       messages: [],
       get sessionId() { throw new Error('the request accessor threw') },
     }
-    const emitted = await collect(harness.raw(PHANTOM, hostile))
+    const emitted = await collect(harness.raw(PHANTOM_ID_LOST, hostile))
     // Every chunk still reached the consumer, in order, and the repair the gate
     // had applied is the one it kept.
-    assert.deepEqual(emitted.map(chunk => chunk.type), PHANTOM.map(chunk => chunk.type))
+    assert.deepEqual(emitted.map(chunk => chunk.type), PHANTOM_ID_LOST.map(chunk => chunk.type))
     assert.equal(toolCall(assemble(emitted)).id, phantomId(1))
     const snapshot = service(harness).snapshot()
     assert.equal(snapshot.counters.errors, 1)
@@ -321,10 +455,11 @@ describe('fail-open at the plugin', () => {
 describe('the service', () => {
   it('states what it cannot do, and resets', async () => {
     const harness = await world()
-    await run(harness, PHANTOM)
+    await run(harness, PHANTOM_ID_LOST)
     const before = service(harness).snapshot()
     assert.ok(before.notCovered.length >= 5)
     assert.match(before.notCovered.join('\n'), /Preventive only/)
+    assert.match(before.notCovered.join('\n'), /A name is never written/)
     service(harness).reset()
     const after = service(harness).snapshot()
     assert.deepEqual(after.counters.verdicts, { keep: 0, answer: 0, suppress: 0 })
@@ -334,9 +469,24 @@ describe('the service', () => {
     await harness.dispose()
   })
 
+  it('counts every reason the report can show', async () => {
+    const harness = await world()
+    await run(harness, PHANTOM_ID_LOST)
+    await collect(harness.stream(PHANTOM_UNNAMED))
+    const reasons = service(harness).snapshot().counters.reasons
+    // A reason missing from the counter block is a decision nobody can see, which
+    // is why the block is built from the exported list rather than by hand.
+    assert.deepEqual(Object.keys(reasons).sort(), [
+      'empty-id', 'empty-name', 'id-lost-at-close', 'id-never-arrived', 'identity-present',
+    ])
+    assert.equal(reasons['empty-id'], 1)
+    assert.equal(reasons['empty-name'], 1)
+    await harness.dispose()
+  })
+
   it('keeps no history when asked for none, and still counts', async () => {
     const harness = await world({ config: { historyLimit: 0 } })
-    await run(harness, PHANTOM)
+    await run(harness, PHANTOM_ID_LOST)
     const snapshot = service(harness).snapshot()
     assert.deepEqual(snapshot.recent, [])
     assert.equal(snapshot.counters.verdicts.answer, 1)
@@ -348,7 +498,7 @@ describe('the service', () => {
     // the trim's job, and without it the history is a leak in a long session.
     const harness = await world({ config: { historyLimit: 2 } })
     for (const sessionId of ['sess-1', 'sess-2', 'sess-3']) {
-      await collect(harness.stream(PHANTOM, { sessionId }))
+      await collect(harness.stream(PHANTOM_ID_LOST, { sessionId }))
     }
     const snapshot = service(harness).snapshot()
     assert.deepEqual(snapshot.recent.map(entry => entry.sessionId), ['sess-2', 'sess-3'])

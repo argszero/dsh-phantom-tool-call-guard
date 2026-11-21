@@ -12,8 +12,22 @@ import { defaultConfig, normalizeConfig } from '../lib/config.js'
 
 describe('normalizeConfig', () => {
   it('resolves every default from an empty configuration', () => {
-    assert.deepEqual(normalizeConfig({}), { mode: 'answer', report: true, historyLimit: 20 })
-    assert.deepEqual(defaultConfig, { mode: 'answer', report: true, historyLimit: 20 })
+    assert.deepEqual(normalizeConfig({}), { mode: 'answer', unnamed: 'suppress', report: true, historyLimit: 20 })
+    assert.deepEqual(defaultConfig, { mode: 'answer', unnamed: 'suppress', report: true, historyLimit: 20 })
+  })
+
+  it('keeps the two spellings it implements for an unnamed call', () => {
+    assert.equal(normalizeConfig({ unnamed: 'suppress' }).unnamed, 'suppress')
+    assert.equal(normalizeConfig({ unnamed: 'keep' }).unnamed, 'keep')
+  })
+
+  it('withholds by default, and leaves the block alone for a spelling it does not implement', () => {
+    // Absent takes the acting default; a typo takes the one that changes nothing,
+    // because a setting nobody wrote correctly must never be the reason a block
+    // the model asked for disappears from the stream.
+    assert.equal(normalizeConfig({}).unnamed, 'suppress')
+    assert.equal(normalizeConfig({ unnamed: 'drop' }).unnamed, 'keep')
+    assert.equal(normalizeConfig({ unnamed: '' }).unnamed, 'keep')
   })
 
   it('keeps every mode it implements', () => {

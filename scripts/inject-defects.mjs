@@ -82,16 +82,25 @@ const MUTATIONS = [
     // which removes the only way to see the decisions without taking them.
     name: 'posture: the repair is applied even when the policy says not to',
     file: 'src/stream.ts',
-    edits: [["      if (written !== undefined && this.applies('answer') && slot.chunk !== undefined) {",
-      '      if (written !== undefined && slot.chunk !== undefined) {']],
+    edits: [['      if (!this.policy.apply) continue',
+      '      if (!this.policy.apply && false) continue']],
   },
   {
     // `suppress` exists for the degenerate phantom. A suppressing decision that
     // still emits the block is the mode doing nothing while reporting success.
     name: 'posture: a suppressing decision still emits the block',
     file: 'src/stream.ts',
-    edits: [["      if (decision === 'suppress' && this.applies('suppress')) slot.chunk = undefined",
-      "      if (decision === 'suppress' && this.applies('suppress') && false) slot.chunk = undefined"]],
+    edits: [["      if (decision === 'suppress') {",
+      "      if (decision === 'suppress' && false) {"]],
+  },
+  {
+    // A name cannot be invented, so a block that names no tool must not be kept.
+    // Dropping the rule writes a call the provider refuses on replay into the
+    // history the session lives in — report #13945, reproduced.
+    name: 'name: a block that names no tool reaches the history anyway',
+    file: 'src/stream.ts',
+    edits: [["    if (tracked.name === undefined && this.policy.unnamed === 'suppress') {",
+      '    if (false) {']],
   },
   {
     // A block that never stated an id is the case the assembler already covers.
@@ -197,6 +206,14 @@ const MUTATIONS = [
     name: 'position: the guard stops covering the registry-scoped dispatch',
     file: 'src/index.ts',
     edits: [['  }, { global: true, prepend: true })', '  }, { global: false, prepend: true })']],
+  },
+  {
+    // A misspelled `unnamed` must not withhold: a setting nobody wrote correctly
+    // is never a good reason for a block the model asked for to disappear.
+    name: 'config: a misspelled unnamed policy withholds instead of holding back',
+    file: 'src/config.ts',
+    edits: [["  if (value === 'suppress' || value === 'keep') return value\n  return 'keep'",
+      "  if (value === 'suppress' || value === 'keep') return value\n  return 'suppress'"]],
   },
   {
     // `observe` exists so an operator can measure before trusting. Making it act

@@ -1,10 +1,10 @@
 /**
  * Configuration, normalized once at mount.
  *
- * The knobs are the three questions an operator actually asks about a plugin
+ * The knobs are the four questions an operator actually asks about a plugin
  * that rewrites a model's output stream: *which repair do you want* (`mode`),
- * *what did you do* (`report`), and *how much of that can I read back*
- * (`historyLimit`).
+ * *and what about a call that names no tool* (`unnamed`), *what did you do*
+ * (`report`), and *how much of that can I read back* (`historyLimit`).
  *
  * @module @argszero/dsh-phantom-tool-call-guard/config
  */
@@ -25,10 +25,26 @@
  */
 export type GuardMode = 'answer' | 'suppress' | 'observe' | 'off'
 
+/**
+ * What happens to a tool-call block that names no tool.
+ *
+ * - `suppress` withholds it. No name can be invented, and a replayed history
+ *   carrying `name: ''` is what a strict provider rejects (report #13945) — so the
+ *   only repair that removes the poison from the message *and* the replay record
+ *   is to leave the block out. The turn completes, because `agent-loop` treats an
+ *   assistant message with no tool-call block as completed.
+ * - `keep` is the pre-0.2 posture: the call is dispatched, fails at the registry
+ *   as an unknown tool, and closes with a `tool/result`. Nothing is withheld, and
+ *   the call stays in the history exactly as the model produced it.
+ */
+export type UnnamedPolicy = 'suppress' | 'keep'
+
 /** The plugin configuration as a user writes it. */
 export interface Config {
   /** Which repair to apply to a tool-call block whose identity is empty. */
   readonly mode?: GuardMode
+  /** What to do with a tool-call block that names no tool. */
+  readonly unnamed?: UnnamedPolicy
   /** Log one line per decision at `info`. */
   readonly report?: boolean
   /** How many recent decisions `snapshot()` keeps. `0` keeps none. */
@@ -38,6 +54,7 @@ export interface Config {
 /** The configuration with every default resolved. */
 export interface Settings {
   readonly mode: GuardMode
+  readonly unnamed: UnnamedPolicy
   readonly report: boolean
   readonly historyLimit: number
 }
@@ -71,6 +88,7 @@ export interface Settings {
  */
 export const defaultConfig: Required<Config> = {
   mode: 'answer',
+  unnamed: 'suppress',
   report: true,
   historyLimit: 20,
 }
@@ -99,6 +117,21 @@ function mode(value: GuardMode | undefined): GuardMode {
 }
 
 /**
+ * Resolve an `unnamed` policy, keeping only the two spellings this plugin implements.
+ *
+ * Absent takes the acting default, and an unrecognised spelling takes `keep`:
+ * the failure mode of a typo has to be the one that changes nothing, and a
+ * setting nobody wrote correctly must never be the reason a block is withheld.
+ * @param value - the configured policy, if any.
+ * @returns the configured policy, the default when absent, or `keep` for anything unrecognised.
+ */
+function unnamed(value: UnnamedPolicy | undefined): UnnamedPolicy {
+  if (value === undefined) return defaultConfig.unnamed
+  if (value === 'suppress' || value === 'keep') return value
+  return 'keep'
+}
+
+/**
  * Resolve a user configuration into the settings the plugin runs with.
  * @param config - the configuration as mounted, possibly empty.
  * @returns every setting, with defaults applied.
@@ -106,6 +139,7 @@ function mode(value: GuardMode | undefined): GuardMode {
 export function normalizeConfig(config: Config): Settings {
   return {
     mode: mode(config.mode),
+    unnamed: unnamed(config.unnamed),
     report: flag(config.report, defaultConfig.report),
     historyLimit: count(config.historyLimit, defaultConfig.historyLimit, 512),
   }

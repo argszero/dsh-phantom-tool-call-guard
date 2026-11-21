@@ -10,10 +10,14 @@ format v4 tool/result at seq N requires toolCallId matching its tool source
 for a tool call the model advertised with **no identity at all** — an empty `id`
 and an empty `name` at the tail of a turn.
 
-One report, one mechanism, one seam:
+Two reports, one seam:
 [#9215](https://github.com/deepseek-ai/deepseek-harness/discussions/9215) —
 *"an empty-identity phantom tool call is written, its result can never validate,
-and the session never recovers"*.
+and the session never recovers"* — and
+[#13945](https://github.com/deepseek-ai/deepseek-harness/discussions/13945),
+which found the other half: a call with a **usable id and no name** passes every
+boundary this harness has, and a strict provider then refuses every later turn
+that replays it.
 
 ## The problem
 
@@ -54,6 +58,37 @@ The session is not slow, or confused, or waiting on a retry budget. It is
 **permanently stuck at that sequence number**, and the write path cannot be
 reached from a plugin: it is core's.
 
+### The other half: a call that names no tool
+
+The id is only one of the two things a tool call has to carry, and the other one
+travels worse. A call with an empty id is refused by this harness's own codec, so
+it fails loudly and locally; a call with an **empty name** is admitted by
+everything, and the refusal arrives from the provider, on replay, out of reach of
+the code that wrote it.
+
+That is #13945. A Kimi Responses-compatible reply carried one valid call and three
+further calls with empty names and empty call ids. The harness dispatched all
+four, persisted their results, and from then on **every** turn in that session
+returned `400`, because the history the harness replays contains calls with no
+name. Nothing in the harness objected: `Session.append` validates event *shapes*
+and documents that it does not validate complete payloads, and the one
+nonempty-toolName check in `packages/core/session/src/surface.ts` guards
+`developer/message` tool-addition blocks, not an assistant `tool-call`.
+
+So the two halves need opposite repairs, and that asymmetry is the whole of 0.2:
+
+| half | who owns the value | what can be done |
+|---|---|---|
+| empty `id` | the harness — it writes one into every durable call | substitute one: the call stays, and it becomes answerable |
+| empty `name` | the model — a name is what it asked for | **nothing honest**; withhold the block, or keep it exactly as produced |
+
+Inventing a name would dispatch a tool the model never asked for, and it would
+write that invention into the history the provider reads. Withholding the block
+instead removes it from the assistant message *and* from the replay record at
+once — the same stream feeds both — so there is nothing left for a strict
+provider to reject. The turn survives: `agent-loop` returns
+`{ kind: 'completed' }` for an assistant message with no tool-call block.
+
 ## What this plugin does
 
 It repairs the identity on the **response side of the `llm/stream` waterfall** —
@@ -86,11 +121,16 @@ is why it reads the two halves of a block differently:
 
 | evidence | the assembler will… | verdict |
 |---|---|---|
+| no delta stated a name, and `block-end.block.name` is empty | build a call that names no tool — **this is the poison a strict provider rejects** | **suppress** (or `keep` under `unnamed: 'keep'`) |
 | `block-end.block.id` present | use it verbatim (a closing block is authoritative) | keep, `identity-present` |
 | `block-end.block.id` **empty or absent** | write `id: ''` — **this is the poison** | **answer**: write `call-phantom-<index>` |
 | last delta's `id` is `''` | write `id: ''` — **this is the poison** | **answer**: write `call-phantom-<index>` |
 | last delta's `id` is `undefined` | fall back to `call-<index>` | keep, `id-never-arrived` |
 | deltas stated an id, `block-end` arrived without one | lose the id the deltas stated | **answer**: restore it, `id-lost-at-close` |
+
+The name row comes first because it decides the block before the id does: a call
+that names no tool has no use for a repaired id. `unnamed: 'keep'` hands such a
+block to the id rows instead, which is exactly the 0.1.1 behaviour.
 
 The distinction in the last two rows is the point. The harness already covers a
 *missing* id; only an **empty** one poisons, and an id the closing block dropped
@@ -106,7 +146,7 @@ provider's own would be a lie about provenance.
 ## Install
 
 ```sh
-npm install @argszero/dsh-phantom-tool-call-guard@0.1.1
+npm install @argszero/dsh-phantom-tool-call-guard@0.2.0
 ```
 
 Then mount it. The package ships a bundle patch
@@ -142,12 +182,12 @@ guard.snapshot()
 ```jsonc
 {
   "mode": "observe",
-  "settings": { "mode": "observe", "report": true, "historyLimit": 20 },
+  "settings": { "mode": "observe", "unnamed": "suppress", "report": true, "historyLimit": 20 },
   "counters": {
     "streams": 41, "errors": 0,
-    "verdicts": { "keep": 38, "answer": 3, "suppress": 0 },
+    "verdicts": { "keep": 37, "answer": 3, "suppress": 1 },
     "reasons": {
-      "identity-present": 35, "empty-id": 3,
+      "identity-present": 35, "empty-name": 1, "empty-id": 3,
       "id-lost-at-close": 0, "id-never-arrived": 0
     }
   },
@@ -156,7 +196,13 @@ guard.snapshot()
       "provider": "deepseek-official", "model": "deepseek-chat",
       "sessionId": "…", "index": 2,
       "verdict": "answer", "reason": "empty-id",
-      "written": "call-phantom-2", "name": undefined
+      "written": "call-phantom-2", "name": "read"
+    },
+    {
+      "provider": "deepseek-official", "model": "deepseek-chat",
+      "sessionId": "…", "index": 1,
+      "verdict": "suppress", "reason": "empty-name",
+      "written": undefined, "name": undefined
     }
   ],
   "notCovered": [ "…" ]
@@ -176,6 +222,7 @@ identical in a log.
 | option | default | meaning |
 |---|---|---|
 | `mode` | `'answer'` | `answer` supplies the missing id so the call becomes answerable; `suppress` drops the block instead; `observe` counts the same decisions and emits the stream unchanged; `off` installs no listener at all |
+| `unnamed` | `'suppress'` | what happens to a block that names no tool: `suppress` withholds it, `keep` leaves it exactly as the model produced it (the 0.1.1 posture) |
 | `report` | `true` | log one line per decision, with the verb the mode earns (`would write` / `wrote` / `dropped`) |
 | `historyLimit` | `20` | how many recent decisions `snapshot()` keeps (`0`…`512`); `0` keeps none while still counting |
 
@@ -189,6 +236,17 @@ that lost the id of a call that is real in every other respect. There,
 `suppress` silently discards a tool the model asked for, and `answer` runs it.
 So the preserving default is the acting one, and the destructive one is one
 config line away.
+
+`unnamed` defaults the other way, and for the opposite reason: `suppress` is the
+default because there is no preserving option. A block that names no tool cannot
+be answered — nothing in the harness will accept a call to a tool with no name,
+and a replayed history carrying one is refused by the provider for every
+subsequent turn (#13945). Keeping it is not "leaving it alone"; it is writing a
+call the session cannot use into the record it lives in. `keep` exists for an
+operator who wants to see such a call in the history while diagnosing a provider,
+and it is a config line away — with the same typo rule as `mode`: an
+unrecognised spelling resolves to `keep`, because a setting nobody wrote
+correctly must never be the reason a block disappears.
 
 An **unrecognised** `mode` spelling resolves to `observe`, not `answer`: the
 failure mode of a typo has to be the one that changes nothing. `off` still
@@ -218,11 +276,14 @@ agent-loop: AssistantStreamAttempt
 ```
 
 Holding is bounded and order is preserved. A block is held *only* while its
-identity is unsettled, which in the shipped adapters is at most one chunk: the
-first `tool-call-delta` normally carries the id. Everything that arrives behind a
-held block waits in the same buffer, so a held block can never be overtaken — no
-chunk is re-ordered and no index is renumbered, because `BlockAssembler` keys
-blocks by index and records their order at first sight.
+identity is unsettled — the id **and** the name, because either can be the thing
+that poisons the call. In the shipped adapters a healthy block settles at the
+first `tool-call-delta`, which carries both; a delta that states an id and no
+name keeps the block held, and that is precisely the block that turns out to name
+no tool. Everything that arrives behind a held block waits in the same buffer, so
+a held block can never be overtaken — no chunk is re-ordered and no index is
+renumbered, because `BlockAssembler` keys blocks by index and records their order
+at first sight.
 
 `inject = ['llm']` makes the LLM service a hard requirement: the seam is a chunk
 stream, so a composition with no models has nothing for this guard to guard, and
@@ -237,10 +298,18 @@ that failed to load.
   that already contains a dangling call needs core. If you are reading this
   because a session is already stuck, this package is the fix for the *next*
   attempt, not a rescue for that one.
-- **It repairs identity and nothing else.** An empty tool *name* is left exactly
-  as the model produced it. Inventing a name would dispatch a tool the model never
-  asked for, while a nameless call fails honestly at the registry and its durable
-  `tool/result` closes the transaction either way.
+- **A name is never written.** A block that names no tool is withheld
+  (`unnamed: 'suppress'`, the default) or kept exactly as the model produced it
+  (`unnamed: 'keep'`). Inventing a name would dispatch a tool the model never
+  asked for and write that invention into the history the provider reads.
+- **A name the deltas stated and the closing block drops is not restored**, unlike
+  an id. The closing block is what the assembler uses, and no shipped adapter
+  drops a name it had already stated — `llm-pi-ai` yields the same tool-call
+  object at `toolcall_start` and `toolcall_end`, so the two halves cannot disagree.
+- **A block whose stream never closed is left to the assembler.** Neither its id
+  nor its name is decided from its absence, because a stream that ended mid-block
+  never stated what the block meant; the harness's max-token truncation path owns
+  that case.
 - **It covers layers mounted below it.** A listener registered with `prepend`
   *after* this plugin mounts sits outside it, and this guard repairs a stream that
   layer has not yet seen. In a deployment with several stream rewrites, mount this
@@ -306,11 +375,17 @@ npm run test:probe-lines   # pin every harness package to one line and re-run th
 
 The integration suite does not simulate the seam. It builds a real Cordis
 context, mounts a real `LlmRuntime` with a real adapter, and drives a real chunk
-stream through the **real** `llm/stream` waterfall. The control arm runs the same
-sequence with the plugin absent and watches the durable result fail to validate
-(`requires toolCallId matching its tool source`); the guarded arm's call carries
-an id and is answerable. A second pair swaps the mount order to prove the
-listener position is real rather than asserted:
+stream through the **real** `llm/stream` waterfall.
+
+The two arms are measured on separate fixtures, because they are separate
+failures: an *id-lost* call that names a tool, and a block that names none. The
+control arm runs each through the same dispatch with the plugin absent — the
+first has its `tool/result` refused (`requires toolCallId matching its tool
+source`), and the second is proven to pass every boundary in the harness, which
+is the point of #13945. The guarded arm's first call carries an id and is
+answerable; its second leaves no tool-call block for the assembler to build. A
+further pair swaps the mount order to prove the listener position is real rather
+than asserted:
 
 ```
 plugin mounted with prepend : the block the loop assembles carries an id

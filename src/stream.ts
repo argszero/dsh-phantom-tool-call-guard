@@ -34,19 +34,47 @@
  *   will fire. A block whose id was never *stated* is therefore left alone; only
  *   one stated as empty can poison, and only it is repaired.
  *
+ * ## Why the name is decided the other way round
+ *
+ * An empty id has a repair and an empty name does not. The id is a value the
+ * harness owns — it writes one into the durable call, and a substituted value
+ * costs nothing but provenance. The name is the model's own act: inventing one
+ * would dispatch a tool the model never asked for, so the only honest repair is
+ * to withhold the block, and withholding is what makes the call disappear from
+ * the message *and* from the replay record at once.
+ *
+ * Withholding is what a strict provider demands (report #13945: Kimi rejected
+ * every later turn with 400 because a replayed history carried calls with empty
+ * names). It is also survivable: `agent-loop` returns `{ kind: 'completed' }` for
+ * an assistant message with no tool-call block, so a turn whose only tool call had
+ * no name ends honestly instead of poisoning the session.
+ *
+ * The two halves therefore form one rule, in this order:
+ *
+ * 1. **The block names no tool** — no delta stated a name and the closing block
+ *    stated none either — so it is withheld (`unnamed: 'suppress'`, the default)
+ *    or, if the operator asked to keep such calls, handed to rule 2.
+ * 2. **The id is unusable** — empty or absent where the closing block is
+ *    authoritative — so it is repaired or withheld per `policy.decision`.
+ *
+ * A block the operator chose to keep still has to be answerable, which is why
+ * rule 2 runs for it and why `unnamed: 'keep'` is the 0.1.1 posture exactly.
+ *
  * ## How long a block is held
  *
- * Exactly as long as its identity is unknown, which in the shipped adapters is
- * at most one chunk behind the block's start:
+ * Exactly as long as its identity is unknown — the id *and* the name, because
+ * either can be the one thing that poisons the call. In the shipped adapters a
+ * healthy block settles at most one chunk behind its start:
  *
  * - `llm-pi-ai` yields the id from the partial it captured at `toolcall_start`
- *   on the block's **first** `tool-call-delta` (and omits `name` entirely when
- *   the provider gave none);
+ *   on the block's **first** `tool-call-delta`, and with it the name whenever the
+ *   provider gave one (it omits `name` entirely when the provider gave none —
+ *   which is exactly the block this plugin withholds);
  * - the DeepSeek Messages translator yields `block-start` and then, immediately,
  *   a `tool-call-delta` carrying `id` and `name` from the block it just built.
  *
  * So the common path buffers one `block-start` and releases it on the next
- * chunk. Only a block whose stream never states a usable identity is held to its
+ * chunk. Only a block whose stream never states both halves is held to its
  * close — and that is the block this plugin exists for. Holding is not free (a
  * downstream consumer sees nothing of a held block), which is why the release is
  * driven by the *first* usable identity rather than by `block-end`: a long
@@ -76,6 +104,8 @@ export type Reason =
   | 'identity-present'
   /** The block's identity was stated, and it was empty. */
   | 'empty-id'
+  /** The block named no tool: no delta stated a name, and the closing block stated none either. */
+  | 'empty-name'
   /** The deltas carried a usable id and the closing block arrived without one. */
   | 'id-lost-at-close'
   /** No chunk ever stated an id, so the assembler's own `?? call-<index>` covers this block. */
@@ -97,8 +127,18 @@ export interface Finding {
 
 /** What the gate is allowed to do, and where it reports. */
 export interface Policy {
-  /** The repair a poisoned block is decided to need. */
+  /** The repair a poisoned block with a usable name is decided to need. */
   readonly decision: 'answer' | 'suppress'
+  /**
+   * What a block that names no tool is decided to need.
+   *
+   * `suppress` is the default: no name can be invented, and a replayed history
+   * carrying `name: ''` is what a strict provider rejects. `keep` is the 0.1.1
+   * posture — the call is dispatched, fails at the registry and closes with a
+   * `tool/result` — kept for an operator who wants to see such a call rather than
+   * have it withheld.
+   */
+  readonly unnamed: 'suppress' | 'keep'
   /**
    * Whether that decision is applied to the emitted stream.
    *
@@ -220,10 +260,14 @@ export class ChunkGate {
           return
         }
         this.hold(tracked, chunk)
-        // The identity arrived, so the block is ordinary. Release it here rather
-        // than at `block-end` so a long argument stream keeps reaching the
-        // consumer as it arrives.
-        if (identity(chunk.id) !== undefined) this.settle(tracked, 'identity-present', 'keep')
+        // Both halves of the identity have arrived, so the block is ordinary.
+        // Release it here rather than at `block-end` so a long argument stream
+        // keeps reaching the consumer as it arrives. A delta that stated an id but
+        // no name is *not* enough: whether the block names a tool at all is still
+        // open, and a name that never arrives is the block this gate withholds.
+        if (identity(chunk.id) !== undefined && tracked.name !== undefined) {
+          this.settle(tracked, 'identity-present', 'keep')
+        }
         return
       }
 
@@ -345,22 +389,28 @@ export class ChunkGate {
     tracked.slots.push(slot)
   }
 
-  /** Whether a decision of this kind would be applied to the stream. */
-  private applies(decision: 'answer' | 'suppress'): boolean {
-    return this.policy.apply && this.policy.decision === decision
-  }
-
   /**
    * Decide a block whose stream has closed.
    * @param tracked - the block being settled.
    * @param id - the id on the closing block, which the assembler uses verbatim.
-   * @param name - the name on the closing block, used only to label the finding
-   *   when no delta stated one: the decision is about identity, and the name is
-   *   never touched.
+   * @param name - the name on the closing block. It is the last word on whether
+   *   this block names a tool at all, and it is never rewritten: the only choice
+   *   the name offers is to keep the block or withhold it.
    */
   private close(tracked: Tracked, id: unknown, name: string): void {
     tracked.closed = true
     if (tracked.name === undefined && name.length > 0) tracked.name = name
+    // Nothing named a tool: no delta did, and the closing block — which the
+    // assembler uses verbatim — does not either. There is no honest repair for
+    // this. A name this gate wrote would dispatch a tool the model never asked
+    // for, and a call replayed with an empty name is exactly what a strict
+    // provider rejects for every later turn (#13945). Withholding the block whole
+    // removes it from the message and from the replay record at once, and an
+    // assistant message with no tool-call block completes the turn honestly.
+    if (tracked.name === undefined && this.policy.unnamed === 'suppress') {
+      this.settle(tracked, 'empty-name', 'suppress')
+      return
+    }
     if (identity(id) !== undefined) {
       this.settle(tracked, 'identity-present', 'keep')
       return
@@ -377,7 +427,8 @@ export class ChunkGate {
    * Release a block and report what was decided.
    * @param tracked - the block to release.
    * @param reason - the evidence for the decision.
-   * @param decision - what is to be done with the block.
+   * @param decision - what is to be done with the block. The gate chooses it per
+   *   arm, so the only question left here is whether this mount is acting at all.
    * @param stated - an id the stream itself declared, when the repair restores one.
    */
   private settle(
@@ -389,10 +440,12 @@ export class ChunkGate {
     const written = decision === 'answer' ? stated ?? phantomId(tracked.index) : undefined
     for (const slot of tracked.slots) {
       slot.held = false
-      if (written !== undefined && this.applies('answer') && slot.chunk !== undefined) {
-        slot.chunk = withId(slot.chunk, written)
+      if (!this.policy.apply) continue
+      if (decision === 'suppress') {
+        slot.chunk = undefined
+        continue
       }
-      if (decision === 'suppress' && this.applies('suppress')) slot.chunk = undefined
+      if (written !== undefined && slot.chunk !== undefined) slot.chunk = withId(slot.chunk, written)
     }
     tracked.slots = []
     tracked.held = false

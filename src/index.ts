@@ -45,11 +45,13 @@
  *
  * It is **preventive, not curative**. A session whose `tool/call` already landed
  * with an empty id cannot be repaired from here, and this plugin does not try:
- * fixing that needs the write path, which is core's. It also repairs identity
- * and nothing else — an empty tool *name* is left exactly as the model produced
- * it, because inventing a name would dispatch a tool the model never asked for,
- * while a nameless call fails honestly at the registry and its durable result
- * closes the transaction. Every one of those boundaries is stated on the
+ * fixing that needs the write path, which is core's.
+ *
+ * It repairs the **id** and withholds the **name**, and it does not invent either.
+ * An id can be substituted because the harness owns that value; a name is the
+ * model's own act, so a block that names no tool is withheld whole rather than
+ * given a name it never had (`unnamed: 'suppress'`, the default), or kept exactly
+ * as produced (`unnamed: 'keep'`). Every one of those boundaries is stated on the
  * service's own `snapshot()`.
  *
  * @module @argszero/dsh-phantom-tool-call-guard
@@ -74,7 +76,7 @@ export const name = 'phantom-tool-call-guard'
  */
 export const inject = ['llm']
 
-export type { Config, GuardMode, Settings } from './config.ts'
+export type { Config, GuardMode, Settings, UnnamedPolicy } from './config.ts'
 export { defaultConfig, normalizeConfig } from './config.ts'
 export type { Finding, Policy, Reason, Verdict } from './stream.ts'
 export { ChunkGate, guardChunks, phantomId } from './stream.ts'
@@ -85,6 +87,7 @@ export const VERDICTS: readonly Verdict[] = ['keep', 'answer', 'suppress']
 /** Every reason a finding can carry, in the order the report lists them. */
 export const REASONS: readonly Reason[] = [
   'identity-present',
+  'empty-name',
   'empty-id',
   'id-lost-at-close',
   'id-never-arrived',
@@ -162,10 +165,12 @@ export const SERVICE = 'phantomToolCallGuard'
 function blindSpots(): string[] {
   return [
     'Preventive only: a session whose `tool/call` already landed with an empty id cannot be repaired here. The refusal happens at the write boundary, before the append, and repairing that needs core.',
-    'Only identity is repaired. An empty tool *name* is left as the model produced it: inventing a name would dispatch a tool the model never asked for, and a nameless call fails at the registry with a durable result that closes the transaction either way.',
+    'A name is never written. A block that names no tool is withheld (`unnamed: \'suppress\'`, the default) or kept as the model produced it (`unnamed: \'keep\'`); inventing a name would dispatch a tool the model never asked for.',
+    'A name the deltas stated and the closing block drops is not restored, unlike an id. The closing block is what the assembler uses, and no shipped adapter drops a name it had already stated — pi-ai yields the same tool-call object at start and close.',
     'Only layers mounted below this plugin are covered: a listener registered with `prepend` after this one runs outside it, so the repair it sees is not the stream the consumer receives.',
     '`observe` applies nothing. It decides, counts and reports exactly as `answer` would, so the two runs differ in nothing but the emitted stream.',
     'A stream the consumer abandons (an abort, a `break`) releases nothing: the chunks of a block still held are dropped with it. That is safe because the harness discards the tool calls of an interrupted attempt, and it means an interrupted turn neither needs nor gets a repair.',
+    'A block whose stream never closed is left to the assembler and the truncation path: neither its id nor its name is decided, because a stream that ended mid-block never stated what it meant.',
     'The minted id is `call-phantom-<index>`, unique within a stream. Two *attempts* in one session can mint the same id; that is harmless unless the earlier attempt\'s `tool/result` never landed, in which case the id stays advertised-unsettled and only a whole-log relationship check would notice.',
   ]
 }
@@ -200,6 +205,12 @@ function sentence(finding: Finding, mode: GuardMode): string {
     ? 'a call with no name'
     : `"${finding.name}"`
   switch (finding.reason) {
+    case 'empty-name':
+      return mode === 'observe'
+        ? `index ${finding.index} named no tool; would drop the block so no call without a name reaches the history`
+        : mode === 'suppress'
+          ? `index ${finding.index} named no tool; dropped the block`
+          : `index ${finding.index} named no tool; dropped the block — a call without a name is rejected on replay`
     case 'empty-id':
       return mode === 'observe'
         ? `index ${finding.index} (${name}) closed without an id; would write "${finding.written ?? ''}" so the call becomes answerable`
@@ -280,6 +291,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       // two runs are comparable: same verdicts, same counters, same log, and the
       // emitted stream as the only difference.
       decision: settings.mode === 'suppress' ? 'suppress' : 'answer',
+      unnamed: settings.unnamed,
       apply: settings.mode !== 'observe',
       onFinding: (finding) => {
         counters.verdicts[finding.verdict] += 1
